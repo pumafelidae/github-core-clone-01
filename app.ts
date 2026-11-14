@@ -1,70 +1,59 @@
-// HTTP router: healthz, API root, REST v3, GraphQL v4, MCP, git smart HTTP, JSON 404.
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Store } from './store.ts';
-import { sendJson, notFound, pathOf } from './util.ts';
+// The HTTP router. One Forge per process; every request is tried against the modules in order
+// (healthz, GraphQL, MCP, REST, git) and falls through to a JSON 404 when nothing matches.
+
+import { createServer } from 'node:http';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { Forge } from './store.ts';
 import { handleRest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { handleGit } from './git.ts';
+import { pathOf, queryOf, sendJson, sendNotFound } from './util.ts';
 
+/** Create the server (not yet listening). main.ts binds it to an ephemeral port. */
 export function createApp(): Server {
-  const store = new Store();
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    try {
-      const path = pathOf(req);
-      const method = req.method ?? 'GET';
-
-      // Boot probe: no auth.
-      if (method === 'GET' && path === '/healthz') {
-        sendJson(res, 200, { ok: true });
-        return;
-      }
-
-      // API root: 200 with the token's scopes.
-      if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-        sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-        return;
-      }
-
-      // GraphQL v4.
-      if (path === '/api/graphql') {
-        if (await handleGraphQL(req, res, store)) return;
-        notFound(res);
-        return;
-      }
-
-      // MCP.
-      if (path === '/mcp') {
-        if (await handleMcp(req, res, store)) return;
-        notFound(res);
-        return;
-      }
-
-      // REST v3.
-      if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-        const segments = path.split('/').filter((s) => s !== '');
-        // segments[0] is 'api', segments[1] is 'v3'
-        if (await handleRest(req, res, store, segments.slice(2))) return;
-        notFound(res);
-        return;
-      }
-
-      // Git smart HTTP: /<owner>/<repo>.git/...
-      const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
-      if (gitMatch) {
-        if (await handleGit(req, res, store, gitMatch[1]!, gitMatch[2]!, gitMatch[3] ?? '/')) return;
-        notFound(res);
-        return;
-      }
-
-      notFound(res);
-    } catch (err) {
-      // Never leak a stack or HTML: a JSON 500.
-      try {
-        sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
-      } catch {
-        // Response already gone; nothing more to do.
-      }
-    }
+  const forge = new Forge();
+  return createServer((req, res) => {
+    void dispatch(req, res, forge);
   });
+}
+
+async function dispatch(req: IncomingMessage, res: ServerResponse, forge: Forge): Promise<void> {
+  try {
+    const path = pathOf(req);
+    const method = (req.method ?? 'GET').toUpperCase();
+    const query = queryOf(req);
+
+    // The harness's readiness probe: no auth, plain "ok".
+    if (method === 'GET' && path === '/healthz') {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+      return;
+    }
+
+    if (method === 'POST' && path === '/api/graphql') {
+      if (await handleGraphQL(req, res, forge)) return;
+    }
+
+    if (method === 'POST' && path === '/mcp') {
+      if (await handleMcp(req, res, forge)) return;
+    }
+
+    if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+      if (await handleRest(req, res, forge, path, method, query)) return;
+    }
+
+    if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
+      if (await handleGit(req, res, forge, path, method)) return;
+    }
+
+    sendNotFound(res, 'Not Found');
+  } catch (err) {
+    process.stderr.write(`[entry] ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+    if (!res.headersSent) {
+      sendJson(res, 500, { message: 'Internal Server Error' });
+    } else {
+      res.destroy();
+    }
+  }
 }
